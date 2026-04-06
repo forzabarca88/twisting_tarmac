@@ -1,24 +1,82 @@
 import argparse
-from pyrosm import OSM, get_data
 import os
+import osmium
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 from shapely.geometry import LineString
 import json
 
+class RoadHandler(osmium.SimpleHandler):
+    def __init__(self, session, limit=1000):
+        super(RoadHandler, self).__init__()
+        self.session = session
+        self.limit = limit
+        self.count = 0
+        self.roads = []
+
+    def way(self, w):
+        if self.count >= self.limit:
+            return
+
+        if 'highway' in w.tags:
+            try:
+                # Build coordinates from nodes
+                coords = []
+                for node in w.nodes:
+                    coords.append((node.lon, node.lat))
+                
+                if len(coords) < 2:
+                    return
+
+                geom = LineString(coords)
+                tags = {tag.k: tag.v for tag in w.tags}
+                
+                # Insert into roads_raw
+                query = sa.text("""
+                    INSERT INTO roads_raw (osm_id, tags, geom, length_m, source)
+                    VALUES (:osm_id, :tags, ST_GeomFromText(:geom_wkt, 4326), :length, :source)
+                    RETURNING id
+                """)
+                
+                res = self.session.execute(query, {
+                    "osm_id": w.id,
+                    "tags": json.dumps(tags),
+                    "geom_wkt": geom.wkt,
+                    "length": 0.0,
+                    "source": "pbf"
+                })
+                road_id = res.scalar()
+                
+                # Create a segment
+                seg_query = sa.text("""
+                    INSERT INTO road_segments (road_id, segment_index, geom, length_m, road_class, maxspeed_kph)
+                    VALUES (:road_id, 0, ST_GeomFromText(:geom_wkt, 4326), :length, :road_class, :maxspeed)
+                """)
+                
+                maxspeed = 0
+                if 'maxspeed' in tags:
+                    speed_str = tags['maxspeed'].split(' ')[0]
+                    if speed_str.isdigit():
+                        maxspeed = int(speed_str)
+
+                self.session.execute(seg_query, {
+                    "road_id": road_id,
+                    "geom_wkt": geom.wkt,
+                    "length": 0.0,
+                    "road_class": tags.get('highway', 'unknown'),
+                    "maxspeed": maxspeed
+                })
+
+                self.count += 1
+                if self.count % 100 == 0:
+                    print(f"Ingested {self.count} roads...")
+                    self.session.commit()
+
+            except Exception as e:
+                print(f"Error processing way {w.id}: {e}")
+
 def ingest(pbf_path, limit=1000):
-    print(f"Ingesting {pbf_path} (limit={limit})...")
-    
-    osm = OSM(pbf_path)
-    # Extract highways
-    # Keep motorways, primary, secondary, tertiary etc
-    drive_net = osm.get_network(network_type="driving")
-    
-    if drive_net is None:
-        print("No driving network found.")
-        return
-        
-    print(f"Extracted {len(drive_net)} road segments.")
+    print(f"Ingesting {pbf_path} (limit={limit}) using osmium...")
     
     # DB connection
     DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/twisting_tarmac")
@@ -32,64 +90,13 @@ def ingest(pbf_path, limit=1000):
     session.execute(sa.text("TRUNCATE TABLE segment_metrics CASCADE"))
     session.commit()
 
-    # Insert into roads_raw
-    count = 0
-    for idx, row in drive_net.iterrows():
-        if count >= limit:
-            break
-            
-        geom = row.geometry
-        if not isinstance(geom, LineString):
-            continue
-            
-        tags = row.to_dict()
-        # remove keys that are not tags or geometry
-        tags.pop('geometry', None)
-        tags.pop('id', None)
-        
-        # Prepare for DB
-        # SQLAlchemy with PostGIS
-        # Using raw SQL for the PoC to avoid complexity with GeoAlchemy2
-        query = sa.text("""
-            INSERT INTO roads_raw (osm_id, tags, geom, length_m, source)
-            VALUES (:osm_id, :tags, ST_GeomFromText(:geom_wkt, 4326), :length, :source)
-            RETURNING id
-        """)
-        
-        # Compute length in meters using ST_Length(ST_Transform(geom, 3857))
-        # For PoC, just use rough estimate or let DB compute it
-        res = session.execute(query, {
-            "osm_id": row.id if hasattr(row, 'id') else idx,
-            "tags": json.dumps(tags),
-            "geom_wkt": geom.wkt,
-            "length": 0.0, # Will compute later
-            "source": pbf_path
-        })
-        road_id = res.scalar()
-        
-        # Create a segment in road_segments for each road_raw
-        # Simple PoC: 1 raw road = 1 segment
-        seg_query = sa.text("""
-            INSERT INTO road_segments (road_id, segment_index, geom, length_m, road_class, maxspeed_kph)
-            VALUES (:road_id, 0, ST_GeomFromText(:geom_wkt, 4326), :length, :road_class, :maxspeed)
-            RETURNING id
-        """)
-        
-        session.execute(seg_query, {
-            "road_id": road_id,
-            "geom_wkt": geom.wkt,
-            "length": 0.0,
-            "road_class": tags.get('highway', 'unknown'),
-            "maxspeed": int(tags.get('maxspeed', '0')) if str(tags.get('maxspeed')).isdigit() else 0
-        })
-        
-        count += 1
-        if count % 100 == 0:
-            print(f"Ingested {count} roads...")
-            session.commit()
-
+    # Process PBF
+    handler = RoadHandler(session, limit)
+    # Important: Apply locations to ways to get node coordinates
+    handler.apply_file(pbf_path, locations=True)
+    
     session.commit()
-    print(f"Successfully ingested {count} roads.")
+    print(f"Successfully ingested {handler.count} roads.")
     session.close()
 
 if __name__ == "__main__":

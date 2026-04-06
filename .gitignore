@@ -48,8 +48,24 @@ coverage.xml
 *.cover
 *.py.cover
 .hypothesis/
-.pytest_cache/
-cover/
+
+# Environment variables
+.env
+
+# Data and PBF files
+data/
+*.osm.pbf
+*.pbf
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
 
 # Translations
 *.mo

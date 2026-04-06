@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:15-3.3
+    environment:
+      POSTGRES_DB: twisting_tarmac
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - tt-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - tt-network
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: docker/fastapi.Dockerfile
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/twisting_tarmac
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    networks:
+      - tt-network
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: docker/streamlit.Dockerfile
+    environment:
+      API_URL: http://fastapi:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - fastapi
+    networks:
+      - tt-network
+
+  ingest:
+    build:
+      context: .
+      dockerfile: docker/fastapi.Dockerfile
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/twisting_tarmac
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - db
+    networks:
+      - tt-network
+    command: ["tail", "-f", "/dev/null"] # Keep alive for manual execution
+
+networks:
+  tt-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
